@@ -1,6 +1,6 @@
 import { BookOpen, Check, Circle, Mic, Plus, Settings, Sparkles, Square, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AppSettings, Conversation, HealthResponse, QuizItem, TranscriptEntry, WordSense } from "../shared/types";
+import type { AppSettings, Conversation, HealthResponse, QuizItem, TranscriptEntry, UsageSummary, WordSense } from "../shared/types";
 import { api } from "./api";
 import { connectRealtime } from "./realtime";
 
@@ -15,8 +15,42 @@ const emptyWord = {
   firstSeenSentenceTranslation: ""
 };
 
+const languageOptions = ["English", "Japanese", "Spanish", "French", "Korean", "Mandarin Chinese"];
+const targetLanguageOptions = ["Japanese", "Spanish", "French", "Korean", "Mandarin Chinese", "English"];
+const realtimeModelOptions = ["gpt-realtime-2"];
+const offlineModelOptions = ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"];
+const voiceOptions = ["marin", "cedar", "alloy", "verse", "shimmer"];
+const partnerStyleOptions = [
+  "patient conversation partner",
+  "friendly commute companion",
+  "mostly Japanese tutor",
+  "casual language exchange partner"
+];
+const quizItemOptions = [5, 10, 15, 20];
+const reviewTargetOptions = [1, 2, 3, 4, 5];
+const sessionMinuteOptions = [10, 15, 20, 30, 45, 60];
+
 function scoreText(word: WordSense) {
   return `R ${word.tracks.recognition.netScore} / P ${word.tracks.production.netScore}`;
+}
+
+function formatUsd(value?: number) {
+  const amount = value ?? 0;
+  if (amount > 0 && amount < 0.01) return "<$0.01";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(amount);
+}
+
+function formatUsageDate(value: string | null | undefined) {
+  return value ? new Date(value).toLocaleString() : "No usage yet";
+}
+
+function optionValues<T extends string | number>(options: T[], current: T) {
+  return options.includes(current) ? options : [current, ...options];
 }
 
 function quizPrompt(item: QuizItem) {
@@ -36,18 +70,21 @@ export function App() {
   const [words, setWords] = useState<WordSense[]>([]);
   const [quiz, setQuiz] = useState<QuizItem[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [nextHealth, nextSettings, nextWords, nextQuiz, nextConversations] = await Promise.all([
+    const [nextHealth, nextUsage, nextSettings, nextWords, nextQuiz, nextConversations] = await Promise.all([
       api.health(),
+      api.usage(),
       api.getSettings(),
       api.listWords(),
       api.dueQuiz(),
       api.listConversations()
     ]);
     setHealth(nextHealth);
+    setUsage(nextUsage);
     setSettings(nextSettings);
     setWords(nextWords);
     setQuiz(nextQuiz);
@@ -89,6 +126,7 @@ export function App() {
         <div className="stat-stack">
           <span><strong>{health?.counts.wordSenses ?? 0}</strong> word senses</span>
           <span><strong>{health?.counts.dueReviews ?? 0}</strong> due reviews</span>
+          <span><strong>{formatUsd(usage?.currentMonth.estimatedCostUsd)}</strong> this month</span>
           <span className={health?.hasOpenAIKey ? "ok" : "bad"}>{health?.hasOpenAIKey ? "OpenAI key loaded" : "Missing OpenAI key"}</span>
         </div>
       </aside>
@@ -100,6 +138,7 @@ export function App() {
             quiz={quiz}
             refresh={refresh}
             conversations={conversations}
+            usage={usage}
             setError={setError}
           />
         )}
@@ -118,11 +157,13 @@ function TalkScreen({
   quiz,
   refresh,
   conversations,
+  usage,
   setError
 }: {
   quiz: QuizItem[];
   refresh: () => Promise<void>;
   conversations: Conversation[];
+  usage: UsageSummary | null;
   setError: (error: string | null) => void;
 }) {
   const [status, setStatus] = useState("Idle");
@@ -221,6 +262,25 @@ function TalkScreen({
         </div>
         <span className="status-pill"><Circle size={10} fill="currentColor" />{status}</span>
       </header>
+
+      <div className="panel usage-strip">
+        <div>
+          <span>Estimated API spend</span>
+          <strong>{formatUsd(usage?.total.estimatedCostUsd)}</strong>
+        </div>
+        <div>
+          <span>This month</span>
+          <strong>{formatUsd(usage?.currentMonth.estimatedCostUsd)}</strong>
+        </div>
+        <div>
+          <span>Usage events</span>
+          <strong>{usage?.total.eventCount ?? 0}</strong>
+        </div>
+        <div>
+          <span>Last update</span>
+          <strong>{formatUsageDate(usage?.total.lastEventAt)}</strong>
+        </div>
+      </div>
 
       <div className="talk-grid">
         <div className="panel call-panel">
@@ -350,7 +410,7 @@ function WordsScreen({
       </div>
 
       <div className="word-list">
-        {words.map((word) => (
+        {activeWords.map((word) => (
           <article className="word-card" key={word.id}>
             <div className="word-topline">
               <div>
@@ -367,6 +427,12 @@ function WordsScreen({
             </div>
           </article>
         ))}
+        {!activeWords.length && (
+          <div className="panel empty-state">
+            <Check size={24} />
+            <p>No active word senses yet.</p>
+          </div>
+        )}
       </div>
     </section>
   );

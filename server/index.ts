@@ -17,6 +17,7 @@ import {
   getCounts,
   getDueQuizItems,
   getSettings,
+  getUsageSummary,
   listConversations,
   listWordSenses,
   recordReview,
@@ -24,6 +25,7 @@ import {
   updateWordSense
 } from "./db";
 import { createRealtimeSession, reconcileVocab } from "./openai";
+import { recordRealtimeUsageFromEvent } from "./usage";
 
 const app = Fastify({ logger: true });
 
@@ -71,6 +73,8 @@ app.get("/api/health", async () => ({
 app.get("/api/settings", async () => getSettings());
 
 app.put("/api/settings", async (request) => updateSettings(settingsSchema.parse(request.body)));
+
+app.get("/api/usage", async () => getUsageSummary());
 
 app.get("/api/word-senses", async () => listWordSenses());
 
@@ -139,6 +143,11 @@ app.post("/api/conversations/:id/events", async (request, reply) => {
   }).parse(request.body);
   if (!getConversation(params.id)) return reply.code(404).send({ error: "Not found" });
   addConversationEvent(params.id, body.type, body.payload, body.timestampMs);
+  recordRealtimeUsageFromEvent({
+    conversationId: params.id,
+    model: getSettings().realtimeModel,
+    payload: body.payload
+  });
   reply.code(201);
   return { ok: true };
 });
@@ -167,7 +176,8 @@ app.post("/api/conversations/:id/end", async (request, reply) => {
       const result = await reconcileVocab({
         settings: getSettings(),
         transcript: transcriptEntries,
-        existingWordSenses: listWordSenses()
+        existingWordSenses: listWordSenses(),
+        conversationId: params.id
       });
       for (const word of result.new_word_senses ?? []) {
         if (!word.surface_form?.trim() || !word.meaning?.trim()) continue;

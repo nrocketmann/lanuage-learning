@@ -1,5 +1,6 @@
 import type { AppSettings, QuizItem, TranscriptEntry, WordSense } from "../shared/types";
 import { requireOpenAIKey } from "./config";
+import { recordResponsesUsage } from "./usage";
 
 type ReconcileResult = {
   summary?: string;
@@ -198,11 +199,13 @@ function extractOutputText(response: unknown): string {
 export async function reconcileVocab({
   settings,
   transcript,
-  existingWordSenses
+  existingWordSenses,
+  conversationId
 }: {
   settings: AppSettings;
   transcript: TranscriptEntry[];
   existingWordSenses: WordSense[];
+  conversationId?: number;
 }): Promise<ReconcileResult> {
   const apiKey = requireOpenAIKey();
   const compactExisting = existingWordSenses.slice(0, 200).map((word) => ({
@@ -225,6 +228,9 @@ export async function reconcileVocab({
       "Prefer words the user explicitly asked about, words the assistant explained, or salient useful words from the conversation.",
       "Do not add names, filler, trivial particles, or noise.",
       "For Japanese, separate different senses of the same surface form.",
+      "Do not add a new word sense when an existing word_sense has the same surface form or lemma and the same meaning expressed as a paraphrase.",
+      "Treat near-identical English glosses as duplicates. For example, 'something that has to be done' and 'something one has to do' are the same sense.",
+      "Only create multiple senses for the same surface form when the meanings are genuinely different in context, not merely differently worded.",
       "For Japanese, provide reading when inferable.",
       "Every new item must include an unambiguous English meaning in context.",
       "Keep the list small: at most 8 new word senses."
@@ -279,6 +285,12 @@ export async function reconcileVocab({
   }
 
   const data = await response.json();
+  recordResponsesUsage({
+    conversationId,
+    operation: "offline_vocab_reconcile",
+    model: settings.offlineModel,
+    response: data
+  });
   const text = extractOutputText(data);
   const cleaned = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
   return JSON.parse(cleaned) as ReconcileResult;

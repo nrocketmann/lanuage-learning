@@ -71,6 +71,22 @@ export type TranscriptEntry = {
   timestampMs?: number;
 };
 
+export type UsageTotals = {
+  estimatedCostUsd: number;
+  eventCount: number;
+  lastEventAt: string | null;
+};
+
+export type UsageOperationSummary = UsageTotals & {
+  operation: string;
+};
+
+export type UsageSummary = {
+  total: UsageTotals;
+  currentMonth: UsageTotals;
+  byOperation: UsageOperationSummary[];
+};
+
 export type HealthResponse = {
   ok: true;
   hasOpenAIKey: boolean;

@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import type { AppSettings, Conversation, Direction, QuizItem, SrsTrack, WordSense } from "../shared/types";
+import type { AppSettings, Conversation, Direction, QuizItem, SrsTrack, UsageSummary, WordSense } from "../shared/types";
 import { serverConfig } from "./config";
 
 fs.mkdirSync(path.dirname(serverConfig.databasePath), { recursive: true });
@@ -98,6 +98,29 @@ CREATE TABLE IF NOT EXISTS reviews (
   created_at TEXT NOT NULL,
   FOREIGN KEY (word_sense_id) REFERENCES word_senses(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS usage_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  conversation_id INTEGER,
+  operation TEXT NOT NULL,
+  model TEXT NOT NULL,
+  input_text_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_input_text_tokens INTEGER NOT NULL DEFAULT 0,
+  output_text_tokens INTEGER NOT NULL DEFAULT 0,
+  input_audio_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_input_audio_tokens INTEGER NOT NULL DEFAULT 0,
+  output_audio_tokens INTEGER NOT NULL DEFAULT 0,
+  estimated_cost_usd REAL NOT NULL DEFAULT 0,
+  raw_usage_json TEXT NOT NULL,
+  idempotency_key TEXT UNIQUE,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `);
 
 const defaultSettings: AppSettings = {
@@ -107,7 +130,7 @@ const defaultSettings: AppSettings = {
   realtimeModel: "gpt-realtime-2",
   offlineModel: "gpt-5.4-mini",
   voice: "marin",
-  maxQuizItems: 5,
+  maxQuizItems: 10,
   recognitionTarget: 3,
   productionTarget: 2,
   productionUnlockSuccesses: 1,
@@ -132,6 +155,13 @@ INSERT OR IGNORE INTO settings (
   defaultSettings.productionUnlockSuccesses,
   defaultSettings.maxSessionMinutes
 );
+
+const maxQuizMigrationKey = "max_quiz_items_default_10";
+const maxQuizMigration = db.prepare("SELECT value FROM app_meta WHERE key = ?").get(maxQuizMigrationKey);
+if (!maxQuizMigration) {
+  db.prepare("UPDATE settings SET max_quiz_items = 10 WHERE id = 1 AND max_quiz_items = 5").run();
+  db.prepare("INSERT INTO app_meta (key, value) VALUES (?, ?)").run(maxQuizMigrationKey, isoNow());
+}
 
 function mapSettings(row: Record<string, unknown>): AppSettings {
   return {
@@ -249,7 +279,123 @@ export type WordSenseInput = {
   sourceConversationId?: number | null;
 };
 
+const duplicateStopwords = new Set([
+  "a",
+  "an",
+  "and",
+  "as",
+  "be",
+  "been",
+  "being",
+  "especially",
+  "for",
+  "has",
+  "have",
+  "in",
+  "is",
+  "it",
+  "of",
+  "one",
+  "or",
+  "such",
+  "that",
+  "the",
+  "to"
+]);
+
+function normalizedGlossParts(word: Pick<WordSenseInput, "meaning" | "meaningDisambiguator">) {
+  return [word.meaning, word.meaningDisambiguator]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token && !duplicateStopwords.has(token));
+}
+
+function diceCoefficient(left: string, right: string) {
+  if (left === right) return 1;
+  if (left.length < 2 || right.length < 2) return 0;
+  const counts = new Map<string, number>();
+  for (let index = 0; index < left.length - 1; index += 1) {
+    const pair = left.slice(index, index + 2);
+    counts.set(pair, (counts.get(pair) ?? 0) + 1);
+  }
+
+  let matches = 0;
+  for (let index = 0; index < right.length - 1; index += 1) {
+    const pair = right.slice(index, index + 2);
+    const count = counts.get(pair) ?? 0;
+    if (count > 0) {
+      counts.set(pair, count - 1);
+      matches += 1;
+    }
+  }
+
+  return (2 * matches) / (left.length + right.length - 2);
+}
+
+function glossSimilarity(left: Pick<WordSenseInput, "meaning" | "meaningDisambiguator">, right: Pick<WordSenseInput, "meaning" | "meaningDisambiguator">) {
+  const leftParts = normalizedGlossParts(left);
+  const rightParts = normalizedGlossParts(right);
+  if (!leftParts.length || !rightParts.length) return 0;
+
+  const leftTokens = new Set(leftParts);
+  const rightTokens = new Set(rightParts);
+  const intersection = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  const tokenJaccard = intersection / new Set([...leftTokens, ...rightTokens]).size;
+  const leftText = leftParts.join(" ");
+  const rightText = rightParts.join(" ");
+  return Math.max(tokenJaccard, diceCoefficient(leftText, rightText));
+}
+
+function readingsCompatible(left?: string | null, right?: string | null) {
+  if (!left?.trim() || !right?.trim()) return true;
+  return left.trim() === right.trim();
+}
+
+function isSimilarWordSense(left: WordSenseInput, right: WordSense) {
+  if (left.surfaceForm.trim() !== right.surfaceForm.trim()) return false;
+  if (!readingsCompatible(left.reading, right.reading)) return false;
+  return glossSimilarity(left, right) >= 0.46;
+}
+
+function pickExistingOrNew(existing: string | null, next?: string | null) {
+  const trimmed = next?.trim() || null;
+  if (!existing) return trimmed;
+  if (!trimmed) return existing;
+  return trimmed.length > existing.length && glossSimilarity({ meaning: existing }, { meaning: trimmed }) < 0.35
+    ? trimmed
+    : existing;
+}
+
+function mergeWordSenseInput(existing: WordSense, input: WordSenseInput): Partial<WordSenseInput> {
+  return {
+    lemma: existing.lemma || input.lemma || null,
+    reading: existing.reading || input.reading || null,
+    partOfSpeech: existing.partOfSpeech || input.partOfSpeech || null,
+    meaning: existing.meaning || input.meaning,
+    meaningDisambiguator: pickExistingOrNew(existing.meaningDisambiguator, input.meaningDisambiguator),
+    nuance: existing.nuance || input.nuance || null,
+    register: existing.register || input.register || null,
+    firstSeenSentence: existing.firstSeenSentence || input.firstSeenSentence || null,
+    firstSeenSentenceTranslation: existing.firstSeenSentenceTranslation || input.firstSeenSentenceTranslation || null
+  };
+}
+
+function findSimilarWordSense(input: WordSenseInput) {
+  return listWordSenses()
+    .filter((word) => word.status === "active")
+    .find((word) => isSimilarWordSense(input, word)) ?? null;
+}
+
 export function createWordSense(input: WordSenseInput): WordSense {
+  const duplicate = findSimilarWordSense(input);
+  if (duplicate) {
+    return updateWordSense(duplicate.id, mergeWordSenseInput(duplicate, input))!;
+  }
+
   const now = isoNow();
   const result = db.prepare(`
     INSERT INTO word_senses (
@@ -506,7 +652,7 @@ export function failConversation(conversationId: number, error: string) {
 }
 
 export function getCounts() {
-  const wordSenses = Number((db.prepare("SELECT COUNT(*) AS count FROM word_senses").get() as { count: number }).count);
+  const wordSenses = Number((db.prepare("SELECT COUNT(*) AS count FROM word_senses WHERE status = 'active'").get() as { count: number }).count);
   const conversations = Number((db.prepare("SELECT COUNT(*) AS count FROM conversations").get() as { count: number }).count);
   const dueReviews = Number((db.prepare(`
     SELECT COUNT(*) AS count FROM srs_tracks
@@ -518,3 +664,109 @@ export function getCounts() {
   `).get(isoNow()) as { count: number }).count);
   return { wordSenses, conversations, dueReviews };
 }
+
+export type UsageEventInput = {
+  conversationId?: number | null;
+  operation: string;
+  model: string;
+  inputTextTokens?: number;
+  cachedInputTextTokens?: number;
+  outputTextTokens?: number;
+  inputAudioTokens?: number;
+  cachedInputAudioTokens?: number;
+  outputAudioTokens?: number;
+  estimatedCostUsd?: number;
+  rawUsage: unknown;
+  idempotencyKey?: string | null;
+};
+
+export function recordUsageEvent(input: UsageEventInput) {
+  db.prepare(`
+    INSERT OR IGNORE INTO usage_events (
+      created_at, conversation_id, operation, model, input_text_tokens, cached_input_text_tokens,
+      output_text_tokens, input_audio_tokens, cached_input_audio_tokens, output_audio_tokens,
+      estimated_cost_usd, raw_usage_json, idempotency_key
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    isoNow(),
+    input.conversationId ?? null,
+    input.operation,
+    input.model,
+    Math.max(0, Math.round(input.inputTextTokens ?? 0)),
+    Math.max(0, Math.round(input.cachedInputTextTokens ?? 0)),
+    Math.max(0, Math.round(input.outputTextTokens ?? 0)),
+    Math.max(0, Math.round(input.inputAudioTokens ?? 0)),
+    Math.max(0, Math.round(input.cachedInputAudioTokens ?? 0)),
+    Math.max(0, Math.round(input.outputAudioTokens ?? 0)),
+    Math.max(0, input.estimatedCostUsd ?? 0),
+    JSON.stringify(input.rawUsage),
+    input.idempotencyKey ?? null
+  );
+}
+
+function usageTotals(whereClause = "", params: unknown[] = []) {
+  const row = db.prepare(`
+    SELECT
+      COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+      COUNT(*) AS event_count,
+      MAX(created_at) AS last_event_at
+    FROM usage_events
+    ${whereClause}
+  `).get(...params) as Record<string, unknown>;
+
+  return {
+    estimatedCostUsd: Number(row.estimated_cost_usd),
+    eventCount: Number(row.event_count),
+    lastEventAt: row.last_event_at ? String(row.last_event_at) : null
+  };
+}
+
+export function getUsageSummary(): UsageSummary {
+  const monthStart = new Date();
+  monthStart.setUTCDate(1);
+  monthStart.setUTCHours(0, 0, 0, 0);
+
+  const byOperationRows = db.prepare(`
+    SELECT
+      operation,
+      COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+      COUNT(*) AS event_count,
+      MAX(created_at) AS last_event_at
+    FROM usage_events
+    GROUP BY operation
+    ORDER BY estimated_cost_usd DESC, operation ASC
+  `).all() as Record<string, unknown>[];
+
+  return {
+    total: usageTotals(),
+    currentMonth: usageTotals("WHERE created_at >= ?", [monthStart.toISOString()]),
+    byOperation: byOperationRows.map((row) => ({
+      operation: String(row.operation),
+      estimatedCostUsd: Number(row.estimated_cost_usd),
+      eventCount: Number(row.event_count),
+      lastEventAt: row.last_event_at ? String(row.last_event_at) : null
+    }))
+  };
+}
+
+export function dedupeSimilarWordSenses() {
+  const active = listWordSenses()
+    .filter((word) => word.status === "active")
+    .sort((left, right) => left.id - right.id);
+
+  for (let index = 0; index < active.length; index += 1) {
+    const keeper = getWordSense(active[index].id);
+    if (!keeper || keeper.status !== "active") continue;
+
+    for (let compareIndex = index + 1; compareIndex < active.length; compareIndex += 1) {
+      const candidate = getWordSense(active[compareIndex].id);
+      if (!candidate || candidate.status !== "active") continue;
+      if (!isSimilarWordSense(candidate, keeper)) continue;
+
+      updateWordSense(keeper.id, mergeWordSenseInput(keeper, candidate));
+      updateWordSense(candidate.id, { status: "ignored" });
+    }
+  }
+}
+
+dedupeSimilarWordSenses();
