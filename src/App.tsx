@@ -2,6 +2,7 @@ import { BookOpen, Check, Circle, Mic, Plus, Settings, Sparkles, Square, Trash2,
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AppSettings, Conversation, HealthResponse, QuizItem, TranscriptEntry, UsageSummary, WordSense } from "../shared/types";
 import { api } from "./api";
+import { connectGeminiRealtime } from "./geminiRealtime";
 import { connectRealtime } from "./realtime";
 
 type Tab = "talk" | "words" | "settings";
@@ -17,9 +18,11 @@ const emptyWord = {
 
 const languageOptions = ["English", "Japanese", "Spanish", "French", "Korean", "Mandarin Chinese"];
 const targetLanguageOptions = ["Japanese", "Spanish", "French", "Korean", "Mandarin Chinese", "English"];
-const realtimeModelOptions = ["gpt-realtime-2"];
+const openAIRealtimeModelOptions = ["gpt-realtime-2"];
+const geminiRealtimeModelOptions = ["gemini-live-2.5-flash-native-audio", "gemini-2.5-flash-native-audio-preview-12-2025"];
 const offlineModelOptions = ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"];
-const voiceOptions = ["marin", "cedar", "alloy", "verse", "shimmer"];
+const openAIVoiceOptions = ["marin", "cedar", "alloy", "verse", "shimmer"];
+const geminiVoiceOptions = ["Puck", "Charon", "Kore", "Fenrir", "Aoede"];
 const partnerStyleOptions = [
   "patient conversation partner",
   "friendly commute companion",
@@ -51,6 +54,18 @@ function formatUsageDate(value: string | null | undefined) {
 
 function optionValues<T extends string | number>(options: T[], current: T) {
   return options.includes(current) ? options : [current, ...options];
+}
+
+function realtimeModelOptionsFor(provider: AppSettings["realtimeProvider"]) {
+  return provider === "gemini" ? geminiRealtimeModelOptions : openAIRealtimeModelOptions;
+}
+
+function voiceOptionsFor(provider: AppSettings["realtimeProvider"]) {
+  return provider === "gemini" ? geminiVoiceOptions : openAIVoiceOptions;
+}
+
+function providerLabel(provider: AppSettings["realtimeProvider"] | undefined) {
+  return provider === "gemini" ? "Gemini Live" : "OpenAI Realtime";
 }
 
 function quizPrompt(item: QuizItem) {
@@ -128,6 +143,10 @@ export function App() {
           <span><strong>{health?.counts.dueReviews ?? 0}</strong> due reviews</span>
           <span><strong>{formatUsd(usage?.currentMonth.estimatedCostUsd)}</strong> this month</span>
           <span className={health?.hasOpenAIKey ? "ok" : "bad"}>{health?.hasOpenAIKey ? "OpenAI key loaded" : "Missing OpenAI key"}</span>
+          <span className={health?.hasGeminiApiKey || health?.hasVertexAccessToken || health?.vertexUseGcloudADC ? "ok" : "bad"}>
+            {health?.hasGeminiApiKey ? "Gemini API key loaded" : health?.hasVertexAccessToken ? "Vertex access token loaded" : health?.vertexUseGcloudADC ? "gcloud ADC enabled" : "Missing Gemini Live auth"}
+          </span>
+          <span className={health?.hasVertexKey ? "ok" : "bad"}>{health?.hasVertexKey ? "Vertex REST key loaded" : "Missing Vertex REST key"}</span>
         </div>
       </aside>
 
@@ -139,6 +158,7 @@ export function App() {
             refresh={refresh}
             conversations={conversations}
             usage={usage}
+            settings={settings}
             setError={setError}
           />
         )}
@@ -158,12 +178,14 @@ function TalkScreen({
   refresh,
   conversations,
   usage,
+  settings,
   setError
 }: {
   quiz: QuizItem[];
   refresh: () => Promise<void>;
   conversations: Conversation[];
   usage: UsageSummary | null;
+  settings: AppSettings | null;
   setError: (error: string | null) => void;
 }) {
   const [status, setStatus] = useState("Idle");
@@ -204,7 +226,7 @@ function TalkScreen({
       const nextConversation = await api.createConversation();
       setConversation(nextConversation);
       setTranscript([]);
-      const connection = await connectRealtime({
+      const realtimeOptions: Parameters<typeof connectRealtime>[0] = {
         onStatus: setStatus,
         onTranscript: (entry) => {
           setTranscript((existing) => [...existing, entry]);
@@ -221,7 +243,10 @@ function TalkScreen({
           await refresh();
           return result;
         }
-      });
+      };
+      const connection = settings?.realtimeProvider === "gemini"
+        ? await connectGeminiRealtime(realtimeOptions)
+        : await connectRealtime(realtimeOptions);
       connectionRef.current = connection;
       setStatus("Live");
     } catch (err) {
@@ -288,7 +313,7 @@ function TalkScreen({
             {live ? <Square size={38} /> : <Mic size={42} />}
           </button>
           <h2>{live ? "Voice session running" : "Ready when you are"}</h2>
-          <p>{live ? "End the session to save the transcript and run vocab reconciliation." : "Your OpenAI key stays on the localhost server."}</p>
+          <p>{live ? "End the session to save the transcript and run vocab reconciliation." : `${providerLabel(settings?.realtimeProvider)} is selected. Provider credentials stay on the localhost server.`}</p>
           <textarea
             value={notes}
             onChange={(event) => setNotes(event.target.value)}
@@ -438,6 +463,70 @@ function WordsScreen({
   );
 }
 
+function SelectField({
+  label,
+  value,
+  options,
+  onChange
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label>
+      {label}
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        {optionValues(options, value).map((option) => (
+          <option value={option} key={option}>{option}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function NumberSelectField({
+  label,
+  value,
+  options,
+  onChange
+}: {
+  label: string;
+  value: number;
+  options: number[];
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label>
+      {label}
+      <select value={value} onChange={(event) => onChange(Number(event.target.value))}>
+        {optionValues(options, value).map((option) => (
+          <option value={option} key={option}>{option}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function ProviderSelectField({
+  value,
+  onChange
+}: {
+  value: AppSettings["realtimeProvider"];
+  onChange: (value: AppSettings["realtimeProvider"]) => void;
+}) {
+  return (
+    <label>
+      Realtime provider
+      <select value={value} onChange={(event) => onChange(event.target.value as AppSettings["realtimeProvider"])}>
+        <option value="openai">OpenAI Realtime</option>
+        <option value="gemini">Gemini Live (Vertex)</option>
+      </select>
+    </label>
+  );
+}
+
 function SettingsScreen({
   settings,
   saveSettings,
@@ -455,6 +544,20 @@ function SettingsScreen({
     setDraft((existing) => ({ ...existing, [key]: value }));
   };
 
+  const updateProvider = (provider: AppSettings["realtimeProvider"]) => {
+    const models = realtimeModelOptionsFor(provider);
+    const voices = voiceOptionsFor(provider);
+    setDraft((existing) => ({
+      ...existing,
+      realtimeProvider: provider,
+      realtimeModel: models.includes(existing.realtimeModel) ? existing.realtimeModel : models[0],
+      voice: voices.includes(existing.voice) ? existing.voice : voices[0]
+    }));
+  };
+
+  const realtimeModelOptions = realtimeModelOptionsFor(draft.realtimeProvider);
+  const voiceOptions = voiceOptionsFor(draft.realtimeProvider);
+
   return (
     <section className="page">
       <header className="page-header">
@@ -467,18 +570,19 @@ function SettingsScreen({
 
       <div className="panel settings-panel">
         <div className="field-grid">
-          <label>Native language<input value={draft.nativeLanguage} onChange={(event) => update("nativeLanguage", event.target.value)} /></label>
-          <label>Target language<input value={draft.targetLanguage} onChange={(event) => update("targetLanguage", event.target.value)} /></label>
-          <label>Realtime model<input value={draft.realtimeModel} onChange={(event) => update("realtimeModel", event.target.value)} /></label>
-          <label>Offline model<input value={draft.offlineModel} onChange={(event) => update("offlineModel", event.target.value)} /></label>
-          <label>Voice<input value={draft.voice} onChange={(event) => update("voice", event.target.value)} /></label>
-          <label>Max quiz items<input type="number" value={draft.maxQuizItems} onChange={(event) => update("maxQuizItems", Number(event.target.value))} /></label>
-          <label>Recognition target<input type="number" value={draft.recognitionTarget} onChange={(event) => update("recognitionTarget", Number(event.target.value))} /></label>
-          <label>Production target<input type="number" value={draft.productionTarget} onChange={(event) => update("productionTarget", Number(event.target.value))} /></label>
-          <label>Production unlock<input type="number" value={draft.productionUnlockSuccesses} onChange={(event) => update("productionUnlockSuccesses", Number(event.target.value))} /></label>
-          <label>Max session minutes<input type="number" value={draft.maxSessionMinutes} onChange={(event) => update("maxSessionMinutes", Number(event.target.value))} /></label>
+          <SelectField label="Native language" value={draft.nativeLanguage} options={languageOptions} onChange={(value) => update("nativeLanguage", value)} />
+          <SelectField label="Target language" value={draft.targetLanguage} options={targetLanguageOptions} onChange={(value) => update("targetLanguage", value)} />
+          <ProviderSelectField value={draft.realtimeProvider} onChange={updateProvider} />
+          <SelectField label="Realtime model" value={draft.realtimeModel} options={realtimeModelOptions} onChange={(value) => update("realtimeModel", value)} />
+          <SelectField label="Offline model" value={draft.offlineModel} options={offlineModelOptions} onChange={(value) => update("offlineModel", value)} />
+          <SelectField label="Voice" value={draft.voice} options={voiceOptions} onChange={(value) => update("voice", value)} />
+          <NumberSelectField label="Max quiz items" value={draft.maxQuizItems} options={quizItemOptions} onChange={(value) => update("maxQuizItems", value)} />
+          <NumberSelectField label="Recognition target" value={draft.recognitionTarget} options={reviewTargetOptions} onChange={(value) => update("recognitionTarget", value)} />
+          <NumberSelectField label="Production target" value={draft.productionTarget} options={reviewTargetOptions} onChange={(value) => update("productionTarget", value)} />
+          <NumberSelectField label="Production unlock" value={draft.productionUnlockSuccesses} options={reviewTargetOptions} onChange={(value) => update("productionUnlockSuccesses", value)} />
+          <NumberSelectField label="Max session minutes" value={draft.maxSessionMinutes} options={sessionMinuteOptions} onChange={(value) => update("maxSessionMinutes", value)} />
         </div>
-        <label>Partner style<textarea value={draft.partnerStyle} onChange={(event) => update("partnerStyle", event.target.value)} /></label>
+        <SelectField label="Partner style" value={draft.partnerStyle} options={partnerStyleOptions} onChange={(value) => update("partnerStyle", value)} />
       </div>
     </section>
   );

@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS settings (
   native_language TEXT NOT NULL,
   target_language TEXT NOT NULL,
   partner_style TEXT NOT NULL,
+  realtime_provider TEXT NOT NULL DEFAULT 'openai',
   realtime_model TEXT NOT NULL,
   offline_model TEXT NOT NULL,
   voice TEXT NOT NULL,
@@ -123,10 +124,20 @@ CREATE TABLE IF NOT EXISTS app_meta (
 );
 `);
 
+function hasColumn(tableName: string, columnName: string) {
+  return (db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>)
+    .some((column) => column.name === columnName);
+}
+
+if (!hasColumn("settings", "realtime_provider")) {
+  db.prepare("ALTER TABLE settings ADD COLUMN realtime_provider TEXT NOT NULL DEFAULT 'openai'").run();
+}
+
 const defaultSettings: AppSettings = {
   nativeLanguage: "English",
   targetLanguage: "Japanese",
   partnerStyle: "patient conversation partner",
+  realtimeProvider: "openai",
   realtimeModel: "gpt-realtime-2",
   offlineModel: "gpt-5.4-mini",
   voice: "marin",
@@ -139,13 +150,14 @@ const defaultSettings: AppSettings = {
 
 db.prepare(`
 INSERT OR IGNORE INTO settings (
-  id, native_language, target_language, partner_style, realtime_model, offline_model, voice,
+  id, native_language, target_language, partner_style, realtime_provider, realtime_model, offline_model, voice,
   max_quiz_items, recognition_target, production_target, production_unlock_successes, max_session_minutes
-) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `).run(
   defaultSettings.nativeLanguage,
   defaultSettings.targetLanguage,
   defaultSettings.partnerStyle,
+  defaultSettings.realtimeProvider,
   defaultSettings.realtimeModel,
   defaultSettings.offlineModel,
   defaultSettings.voice,
@@ -168,6 +180,7 @@ function mapSettings(row: Record<string, unknown>): AppSettings {
     nativeLanguage: String(row.native_language),
     targetLanguage: String(row.target_language),
     partnerStyle: String(row.partner_style),
+    realtimeProvider: String(row.realtime_provider ?? "openai") as AppSettings["realtimeProvider"],
     realtimeModel: String(row.realtime_model),
     offlineModel: String(row.offline_model),
     voice: String(row.voice),
@@ -189,6 +202,7 @@ export function updateSettings(settings: AppSettings): AppSettings {
       native_language = ?,
       target_language = ?,
       partner_style = ?,
+      realtime_provider = ?,
       realtime_model = ?,
       offline_model = ?,
       voice = ?,
@@ -202,6 +216,7 @@ export function updateSettings(settings: AppSettings): AppSettings {
     settings.nativeLanguage,
     settings.targetLanguage,
     settings.partnerStyle,
+    settings.realtimeProvider,
     settings.realtimeModel,
     settings.offlineModel,
     settings.voice,
@@ -609,7 +624,7 @@ export function createConversation(): Conversation {
   const result = db.prepare(`
     INSERT INTO conversations (status, started_at, target_language, native_language, partner_style, model)
     VALUES ('active', ?, ?, ?, ?, ?)
-  `).run(isoNow(), settings.targetLanguage, settings.nativeLanguage, settings.partnerStyle, settings.realtimeModel);
+  `).run(isoNow(), settings.targetLanguage, settings.nativeLanguage, settings.partnerStyle, `${settings.realtimeProvider}:${settings.realtimeModel}`);
   return getConversation(Number(result.lastInsertRowid))!;
 }
 

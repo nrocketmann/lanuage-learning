@@ -1,9 +1,11 @@
 export type Direction = "recognition" | "production";
+export type RealtimeProvider = "openai" | "gemini";
 
 export type AppSettings = {
   nativeLanguage: string;
   targetLanguage: string;
   partnerStyle: string;
+  realtimeProvider: RealtimeProvider;
   realtimeModel: string;
   offlineModel: string;
   voice: string;
@@ -90,9 +92,30 @@ export type UsageSummary = {
 export type HealthResponse = {
   ok: true;
   hasOpenAIKey: boolean;
+  hasGeminiApiKey: boolean;
+  hasVertexKey: boolean;
+  hasVertexAccessToken: boolean;
+  hasVertexProjectId: boolean;
+  vertexUseGcloudADC: boolean;
   counts: {
     wordSenses: number;
     conversations: number;
     dueReviews: number;
   };
+};
+
+export type GeminiSmokeAttempt = {
+  endpoint: "vertex-live" | "developer-api" | "vertex-express-rest";
+  credentialSource: "vertex-key" | "vertex-access-token" | "gcloud-adc" | "gemini-api-key" | "vertex-express-key" | "missing";
+  model: string;
+  ok: boolean;
+  text?: string;
+  error?: string;
+  closeCode?: number;
+  closeReason?: string;
+};
+
+export type GeminiSmokeResponse = {
+  ok: boolean;
+  attempts: GeminiSmokeAttempt[];
 };

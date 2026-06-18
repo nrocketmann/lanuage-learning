@@ -1,4 +1,4 @@
-import type { AppSettings, Conversation, HealthResponse, QuizItem, TranscriptEntry, UsageSummary, WordSense } from "../shared/types";
+import type { AppSettings, Conversation, GeminiSmokeResponse, HealthResponse, QuizItem, TranscriptEntry, UsageSummary, WordSense } from "../shared/types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -20,6 +20,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
   usage: () => request<UsageSummary>("/api/usage"),
+  geminiSmoke: () => request<GeminiSmokeResponse>("/api/gemini/smoke", { method: "POST", body: "{}" }),
   getSettings: () => request<AppSettings>("/api/settings"),
   updateSettings: (settings: AppSettings) => request<AppSettings>("/api/settings", {
     method: "PUT",

@@ -1,5 +1,6 @@
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
+import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
 import path from "node:path";
 import { z } from "zod";
@@ -24,6 +25,7 @@ import {
   updateSettings,
   updateWordSense
 } from "./db";
+import { handleGeminiLiveSocket, smokeGeminiLive } from "./gemini";
 import { createRealtimeSession, reconcileVocab } from "./openai";
 import { recordRealtimeUsageFromEvent } from "./usage";
 
@@ -37,10 +39,17 @@ await app.register(cors, {
   origin: ["http://127.0.0.1:5173", "http://localhost:5173"]
 });
 
+await app.register(fastifyWebsocket, {
+  options: {
+    maxPayload: 2 * 1024 * 1024
+  }
+});
+
 const settingsSchema = z.object({
   nativeLanguage: z.string().min(1),
   targetLanguage: z.string().min(1),
   partnerStyle: z.string().min(1),
+  realtimeProvider: z.enum(["openai", "gemini"]).default("openai"),
   realtimeModel: z.string().min(1),
   offlineModel: z.string().min(1),
   voice: z.string().min(1),
@@ -67,6 +76,11 @@ const wordSenseSchema = z.object({
 app.get("/api/health", async () => ({
   ok: true,
   hasOpenAIKey: Boolean(serverConfig.openAIKey),
+  hasGeminiApiKey: Boolean(serverConfig.geminiApiKey),
+  hasVertexKey: Boolean(serverConfig.vertexKey),
+  hasVertexAccessToken: Boolean(serverConfig.vertexAccessToken),
+  hasVertexProjectId: Boolean(serverConfig.vertexProjectId),
+  vertexUseGcloudADC: serverConfig.vertexUseGcloudADC,
   counts: getCounts()
 }));
 
@@ -75,6 +89,19 @@ app.get("/api/settings", async () => getSettings());
 app.put("/api/settings", async (request) => updateSettings(settingsSchema.parse(request.body)));
 
 app.get("/api/usage", async () => getUsageSummary());
+
+app.post("/api/gemini/smoke", async () => smokeGeminiLive(getSettings()));
+
+app.get("/api/gemini/live", { websocket: true }, (socket) => {
+  const settings = getSettings();
+  const dueItems = getDueQuizItems(settings.maxQuizItems);
+  void handleGeminiLiveSocket({
+    socket,
+    settings,
+    dueItems,
+    log: app.log
+  });
+});
 
 app.get("/api/word-senses", async () => listWordSenses());
 
@@ -206,6 +233,9 @@ app.post("/api/conversations/:id/end", async (request, reply) => {
 
 app.post("/api/realtime/session", async () => {
   const settings = getSettings();
+  if (settings.realtimeProvider !== "openai") {
+    throw new Error("The OpenAI session endpoint only supports OpenAI Realtime. Use /api/gemini/live for Gemini Live WebSocket sessions.");
+  }
   const dueItems = getDueQuizItems(settings.maxQuizItems);
   return createRealtimeSession({
     settings,

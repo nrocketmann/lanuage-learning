@@ -19,6 +19,8 @@ type ReconcileResult = {
   ignored_events?: Array<{ reason: string; evidence?: string }>;
 };
 
+type ReconcileWordSense = NonNullable<ReconcileResult["new_word_senses"]>[number];
+
 function buildQuizPrompt(item: QuizItem) {
   const word = item.wordSense;
   if (item.track.direction === "recognition") {
@@ -49,7 +51,7 @@ function buildQuizItems(dueItems: QuizItem[]) {
   });
 }
 
-function buildReviewTool() {
+export function buildReviewTool() {
   return {
     type: "function",
     name: "record_quiz_review",
@@ -196,6 +198,134 @@ function extractOutputText(response: unknown): string {
   return parts.join("\n");
 }
 
+function parseJsonObject<T>(text: string): T {
+  const cleaned = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  return JSON.parse(cleaned) as T;
+}
+
+function sentenceLooksExplanatory(word: ReconcileWordSense) {
+  const sentence = word.first_seen_sentence?.trim();
+  if (!sentence) return true;
+
+  const haystack = `${sentence}\n${word.first_seen_sentence_translation ?? ""}`.toLowerCase();
+  const explanationMarkers = [
+    " means ",
+    " meaning",
+    "refers to",
+    "is close to",
+    "close to",
+    "translation",
+    "definition",
+    "意味",
+    "近い",
+    "っていう意味",
+    "という意味",
+    "とは"
+  ];
+
+  return explanationMarkers.some((marker) => haystack.includes(marker));
+}
+
+async function generateQuizExample({
+  apiKey,
+  settings,
+  conversationId,
+  word
+}: {
+  apiKey: string;
+  settings: AppSettings;
+  conversationId?: number;
+  word: ReconcileWordSense;
+}) {
+  const prompt = {
+    task: "Generate a neutral quiz example sentence for one saved vocabulary sense.",
+    target_language: settings.targetLanguage,
+    native_language: settings.nativeLanguage,
+    word_sense: {
+      surface_form: word.surface_form,
+      lemma: word.lemma,
+      reading: word.reading,
+      meaning: word.meaning,
+      meaning_disambiguator: word.meaning_disambiguator,
+      nuance: word.nuance,
+      register: word.register
+    },
+    rules: [
+      "Return JSON only.",
+      "Write exactly one natural target-language sentence that uses this same word sense.",
+      "The sentence must not define, translate, contrast, or explain the word.",
+      "The sentence should be useful as a quiz context: enough context to disambiguate the sense, but not enough to give away the English answer.",
+      "For Japanese, natural inflection or particles are fine."
+    ],
+    output_shape: {
+      sentence: "target-language sentence",
+      translation: "native-language translation of sentence"
+    }
+  };
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.offlineModel,
+      input: [
+        {
+          role: "system",
+          content: "You are a careful bilingual language teacher. You return compact, valid JSON and nothing else."
+        },
+        {
+          role: "user",
+          content: JSON.stringify(prompt)
+        }
+      ],
+      max_output_tokens: 400
+    })
+  });
+
+  if (!response.ok) return;
+  const data = await response.json();
+  recordResponsesUsage({
+    conversationId,
+    operation: "offline_example_sentence",
+    model: settings.offlineModel,
+    response: data
+  });
+
+  let parsed: { sentence?: unknown; translation?: unknown };
+  try {
+    parsed = parseJsonObject<{ sentence?: unknown; translation?: unknown }>(extractOutputText(data));
+  } catch {
+    return;
+  }
+  if (typeof parsed.sentence === "string" && parsed.sentence.trim()) {
+    word.first_seen_sentence = parsed.sentence.trim();
+  }
+  if (typeof parsed.translation === "string" && parsed.translation.trim()) {
+    word.first_seen_sentence_translation = parsed.translation.trim();
+  }
+}
+
+async function replaceExplanatoryQuizExamples({
+  apiKey,
+  settings,
+  conversationId,
+  result
+}: {
+  apiKey: string;
+  settings: AppSettings;
+  conversationId?: number;
+  result: ReconcileResult;
+}) {
+  for (const word of result.new_word_senses ?? []) {
+    if (sentenceLooksExplanatory(word)) {
+      await generateQuizExample({ apiKey, settings, conversationId, word });
+    }
+  }
+}
+
 export async function reconcileVocab({
   settings,
   transcript,
@@ -233,6 +363,10 @@ export async function reconcileVocab({
       "Only create multiple senses for the same surface form when the meanings are genuinely different in context, not merely differently worded.",
       "For Japanese, provide reading when inferable.",
       "Every new item must include an unambiguous English meaning in context.",
+      "Quiz sentences must not give away the answer.",
+      "Do not use an explanatory sentence as first_seen_sentence. Avoid sentences that define, translate, contrast, or explain the word, such as sentences containing 'means', 'meaning', '近い', '意味', 'っていう意味', or 'とは'.",
+      "If the transcript only contains the word inside an explanation, generate one natural target-language example sentence that uses the same word sense without explaining it, and put that generated sentence in first_seen_sentence.",
+      "When first_seen_sentence is generated, first_seen_sentence_translation should translate that generated sentence, not the original explanation.",
       "Keep the list small: at most 8 new word senses."
     ],
     output_shape: {
@@ -247,8 +381,8 @@ export async function reconcileVocab({
           meaning_disambiguator: "unambiguous sense description",
           nuance: "optional nuance",
           register: "optional register",
-          first_seen_sentence: "sentence where the sense appeared",
-          first_seen_sentence_translation: "English translation of that sentence"
+          first_seen_sentence: "natural target-language example sentence for quizzing; use the actual sentence only when it does not reveal the meaning, otherwise generate one",
+          first_seen_sentence_translation: "English translation of first_seen_sentence"
         }
       ],
       ignored_events: [{ reason: "why no word was added", evidence: "optional" }]
@@ -292,6 +426,12 @@ export async function reconcileVocab({
     response: data
   });
   const text = extractOutputText(data);
-  const cleaned = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-  return JSON.parse(cleaned) as ReconcileResult;
+  const result = parseJsonObject<ReconcileResult>(text);
+  await replaceExplanatoryQuizExamples({
+    apiKey,
+    settings,
+    conversationId,
+    result
+  });
+  return result;
 }

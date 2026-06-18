@@ -17,7 +17,7 @@ body {
   min-height: 100vh;
 }
 
-button, input, textarea {
+button, input, select, textarea {
   font: inherit;
 }
 
@@ -194,6 +194,27 @@ h3 {
   gap: 20px;
 }
 
+.usage-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 16px;
+}
+
+.usage-strip div {
+  display: grid;
+  gap: 4px;
+}
+
+.usage-strip span {
+  color: #69737c;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.usage-strip strong {
+  font-size: 1.1rem;
+}
+
 .panel,
 .word-card {
   border: 1px solid #dedbd2;
@@ -351,6 +372,7 @@ label {
 }
 
 input,
+select,
 textarea {
   border: 1px solid #d6d1c7;
   border-radius: 8px;
@@ -452,6 +474,7 @@ blockquote {
   }
 
   .field-grid,
+  .usage-strip,
   .session-row {
     grid-template-columns: 1fr;
   }
