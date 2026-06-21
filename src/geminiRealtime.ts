@@ -2,6 +2,7 @@ import type { TranscriptEntry } from "../shared/types";
 import type { QuizReviewToolArgs } from "./realtime";
 
 type GeminiRealtimeOptions = {
+  conversationId?: number;
   onStatus: (status: string) => void;
   onTranscript: (entry: TranscriptEntry) => void;
   onEvent: (type: string, payload: unknown) => void;
@@ -99,26 +100,33 @@ function inlineAudioChunks(event: Record<string, unknown>) {
   return chunks;
 }
 
-function transcriptionEntries(event: Record<string, unknown>): TranscriptEntry[] {
-  const entries: TranscriptEntry[] = [];
+function transcriptionChunks(event: Record<string, unknown>) {
   const serverContent = objectFrom(event.serverContent ?? event.server_content);
   const inputTranscription = objectFrom(serverContent.inputTranscription ?? serverContent.input_transcription);
   const outputTranscription = objectFrom(serverContent.outputTranscription ?? serverContent.output_transcription);
 
-  if (typeof inputTranscription.text === "string" && inputTranscription.text.trim()) {
-    entries.push({ role: "user", text: inputTranscription.text.trim() });
-  }
-
-  if (typeof outputTranscription.text === "string" && outputTranscription.text.trim()) {
-    entries.push({ role: "assistant", text: outputTranscription.text.trim() });
-  }
-
-  return entries;
+  return [
+    {
+      role: "user" as const,
+      text: typeof inputTranscription.text === "string" ? inputTranscription.text : "",
+      finished: inputTranscription.finished === true
+    },
+    {
+      role: "assistant" as const,
+      text: typeof outputTranscription.text === "string" ? outputTranscription.text : "",
+      finished: outputTranscription.finished === true
+    }
+  ];
 }
 
 function isInterrupted(event: Record<string, unknown>) {
   const serverContent = objectFrom(event.serverContent ?? event.server_content);
   return serverContent.interrupted === true;
+}
+
+function isTurnComplete(event: Record<string, unknown>) {
+  const serverContent = objectFrom(event.serverContent ?? event.server_content);
+  return serverContent.turnComplete === true || serverContent.turn_complete === true;
 }
 
 function extractFunctionCalls(event: Record<string, unknown>): GeminiFunctionCall[] {
@@ -171,15 +179,50 @@ function redactInlineAudio(value: unknown): unknown {
   return output;
 }
 
-function bridgeUrl() {
+function summarizeGeminiEvent(event: Record<string, unknown>) {
+  if (event.setupComplete || event.setup_complete) return { kind: "setup_complete" };
+
+  const serverContent = objectFrom(event.serverContent ?? event.server_content);
+  if (serverContent.interrupted === true) return { kind: "interrupted" };
+  if (serverContent.generationComplete === true || serverContent.generation_complete === true) {
+    return { kind: "generation_complete" };
+  }
+  if (serverContent.turnComplete === true || serverContent.turn_complete === true) {
+    return {
+      kind: "turn_complete",
+      usageMetadata: event.usageMetadata ?? event.usage_metadata ?? null
+    };
+  }
+
+  const toolCall = objectFrom(event.toolCall ?? event.tool_call);
+  const rawCalls = toolCall.functionCalls ?? toolCall.function_calls;
+  if (Array.isArray(rawCalls)) {
+    return {
+      kind: "tool_call",
+      functionCalls: rawCalls.map((rawCall) => {
+        const call = objectFrom(rawCall);
+        return {
+          id: typeof call.id === "string" ? call.id : null,
+          name: typeof call.name === "string" ? call.name : null
+        };
+      })
+    };
+  }
+
+  return null;
+}
+
+function bridgeUrl(conversationId?: number) {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${window.location.host}/api/gemini/live`;
+  const url = new URL(`${scheme}://${window.location.host}/api/gemini/live`);
+  if (conversationId) url.searchParams.set("conversationId", String(conversationId));
+  return url.toString();
 }
 
 export async function connectGeminiRealtime(options: GeminiRealtimeOptions) {
   options.onStatus("Opening Gemini bridge");
 
-  const ws = new WebSocket(bridgeUrl());
+  const ws = new WebSocket(bridgeUrl(options.conversationId));
   const handledToolCalls = new Set<string>();
   const outputContext = new AudioContext();
   const outputSources = new Set<AudioBufferSourceNode>();
@@ -190,6 +233,29 @@ export async function connectGeminiRealtime(options: GeminiRealtimeOptions) {
   let playhead = 0;
   let closed = false;
   let opened = false;
+  let ready = false;
+  let lastError: string | null = null;
+  const pendingTranscript: Record<TranscriptEntry["role"], string> = {
+    user: "",
+    assistant: "",
+    system: ""
+  };
+
+  const appendTranscript = (role: "user" | "assistant", text: string) => {
+    if (!text) return;
+    pendingTranscript[role] += text;
+  };
+
+  const flushTranscript = (role: "user" | "assistant") => {
+    const text = pendingTranscript[role].trim();
+    pendingTranscript[role] = "";
+    if (text) options.onTranscript({ role, text });
+  };
+
+  const flushAllTranscripts = () => {
+    flushTranscript("user");
+    flushTranscript("assistant");
+  };
 
   const stopPlayback = () => {
     for (const source of outputSources) {
@@ -202,6 +268,8 @@ export async function connectGeminiRealtime(options: GeminiRealtimeOptions) {
     outputSources.clear();
     playhead = outputContext.currentTime;
   };
+
+  const assistantAudioIsPlaying = () => outputSources.size > 0 || playhead > outputContext.currentTime + 0.05;
 
   const playPcm16 = (base64: string, sampleRate: number) => {
     const samples = base64ToInt16(base64);
@@ -251,65 +319,88 @@ export async function connectGeminiRealtime(options: GeminiRealtimeOptions) {
   };
 
   const handleGeminiEvent = (event: Record<string, unknown>) => {
-    options.onEvent("gemini_event", redactInlineAudio(event));
+    const summary = summarizeGeminiEvent(event);
+    if (summary) options.onEvent("gemini_event", summary);
 
-    if (isInterrupted(event)) stopPlayback();
+    if (isInterrupted(event)) {
+      stopPlayback();
+      flushTranscript("assistant");
+    }
 
     for (const chunk of inlineAudioChunks(event)) {
       playPcm16(chunk.data, chunk.sampleRate);
     }
 
-    for (const entry of transcriptionEntries(event)) {
-      options.onTranscript(entry);
+    for (const chunk of transcriptionChunks(event)) {
+      appendTranscript(chunk.role, chunk.text);
+      if (chunk.finished) flushTranscript(chunk.role);
     }
+
+    if (isTurnComplete(event)) flushTranscript("assistant");
 
     void handleToolCalls(event);
   };
 
-  const openPromise = new Promise<void>((resolve, reject) => {
+  const readyPromise = new Promise<void>((resolve, reject) => {
     const timeout = window.setTimeout(() => {
-      reject(new Error("Timed out opening Gemini bridge."));
+      reject(new Error(lastError ?? "Timed out opening Gemini bridge."));
     }, 15_000);
 
     ws.onopen = () => {
       opened = true;
-      window.clearTimeout(timeout);
-      resolve();
     };
 
     ws.onerror = () => {
-      if (!opened) {
+      if (!ready) {
         window.clearTimeout(timeout);
-        reject(new Error("Could not open Gemini bridge."));
+        reject(new Error(lastError ?? (opened ? "Gemini bridge failed before it was ready." : "Could not open Gemini bridge.")));
+      }
+    };
+
+    ws.onmessage = (message) => {
+      try {
+        const payload = JSON.parse(String(message.data)) as Record<string, unknown>;
+        if (payload.type === "status" && typeof payload.status === "string") {
+          options.onStatus(payload.status);
+          if (payload.status === "Connected" && !ready) {
+            ready = true;
+            window.clearTimeout(timeout);
+            resolve();
+          }
+          return;
+        }
+        if (payload.type === "error" && typeof payload.error === "string") {
+          lastError = payload.error;
+          options.onStatus(`Gemini error: ${payload.error}`);
+          options.onEvent("gemini_error", { error: payload.error });
+          if (!ready) {
+            window.clearTimeout(timeout);
+            reject(new Error(payload.error));
+          }
+          return;
+        }
+        if (payload.type === "event") {
+          handleGeminiEvent(objectFrom(payload.event));
+        }
+      } catch {
+        options.onEvent("gemini_unparsed", message.data);
+      }
+    };
+
+    ws.onclose = () => {
+      flushAllTranscripts();
+      if (!closed) {
+        options.onStatus(lastError ? `Gemini error: ${lastError}` : "Gemini bridge closed");
+      }
+      if (!ready) {
+        window.clearTimeout(timeout);
+        reject(new Error(lastError ?? "Gemini bridge closed before it was ready."));
       }
     };
   });
 
-  ws.onmessage = (message) => {
-    try {
-      const payload = JSON.parse(String(message.data)) as Record<string, unknown>;
-      if (payload.type === "status" && typeof payload.status === "string") {
-        options.onStatus(payload.status);
-        return;
-      }
-      if (payload.type === "error" && typeof payload.error === "string") {
-        options.onStatus(`Gemini error: ${payload.error}`);
-        return;
-      }
-      if (payload.type === "event") {
-        handleGeminiEvent(objectFrom(payload.event));
-      }
-    } catch {
-      options.onEvent("gemini_unparsed", message.data);
-    }
-  };
-
-  ws.onclose = () => {
-    if (!closed) options.onStatus("Gemini bridge closed");
-  };
-
   try {
-    await openPromise;
+    await readyPromise;
     await outputContext.resume();
 
     options.onStatus("Requesting microphone");
@@ -328,6 +419,7 @@ export async function connectGeminiRealtime(options: GeminiRealtimeOptions) {
 
     processor.onaudioprocess = (event) => {
       if (closed || ws.readyState !== WebSocket.OPEN || !inputContext) return;
+      if (assistantAudioIsPlaying()) return;
       const input = event.inputBuffer.getChannelData(0);
       const pcm = downsampleTo16BitPcm(input, inputContext.sampleRate);
       ws.send(JSON.stringify({
@@ -358,6 +450,7 @@ export async function connectGeminiRealtime(options: GeminiRealtimeOptions) {
       for (const track of stream?.getTracks() ?? []) track.stop();
       void inputContext?.close();
       stopPlayback();
+      flushAllTranscripts();
       void outputContext.close();
       options.onStatus("Closed");
     }

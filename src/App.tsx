@@ -143,8 +143,8 @@ export function App() {
           <span><strong>{health?.counts.dueReviews ?? 0}</strong> due reviews</span>
           <span><strong>{formatUsd(usage?.currentMonth.estimatedCostUsd)}</strong> this month</span>
           <span className={health?.hasOpenAIKey ? "ok" : "bad"}>{health?.hasOpenAIKey ? "OpenAI key loaded" : "Missing OpenAI key"}</span>
-          <span className={health?.hasGeminiApiKey || health?.hasVertexAccessToken || health?.vertexUseGcloudADC ? "ok" : "bad"}>
-            {health?.hasGeminiApiKey ? "Gemini API key loaded" : health?.hasVertexAccessToken ? "Vertex access token loaded" : health?.vertexUseGcloudADC ? "gcloud ADC enabled" : "Missing Gemini Live auth"}
+          <span className={health?.hasGeminiApiKey || health?.hasVertexAccessToken || health?.vertexUseGcloudAuth || health?.vertexUseGcloudADC ? "ok" : "bad"}>
+            {health?.hasGeminiApiKey ? "Gemini API key loaded" : health?.hasVertexAccessToken ? "Vertex access token loaded" : health?.vertexUseGcloudAuth ? "gcloud auth enabled" : health?.vertexUseGcloudADC ? "gcloud ADC enabled" : "Missing Gemini Live auth"}
           </span>
           <span className={health?.hasVertexKey ? "ok" : "bad"}>{health?.hasVertexKey ? "Vertex REST key loaded" : "Missing Vertex REST key"}</span>
         </div>
@@ -196,6 +196,7 @@ function TalkScreen({
   const [hintVisible, setHintVisible] = useState(false);
   const [processing, setProcessing] = useState(false);
   const connectionRef = useRef<{ close: () => void } | null>(null);
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
 
   const currentQuiz = quiz[reviewIndex];
   const live = Boolean(connectionRef.current);
@@ -225,11 +226,13 @@ function TalkScreen({
     try {
       const nextConversation = await api.createConversation();
       setConversation(nextConversation);
+      transcriptRef.current = [];
       setTranscript([]);
       const realtimeOptions: Parameters<typeof connectRealtime>[0] = {
         onStatus: setStatus,
         onTranscript: (entry) => {
-          setTranscript((existing) => [...existing, entry]);
+          transcriptRef.current = [...transcriptRef.current, entry];
+          setTranscript(transcriptRef.current);
         },
         onEvent: (type, payload) => {
           api.addEvent(nextConversation.id, { type, payload }).catch(() => undefined);
@@ -245,7 +248,7 @@ function TalkScreen({
         }
       };
       const connection = settings?.realtimeProvider === "gemini"
-        ? await connectGeminiRealtime(realtimeOptions)
+        ? await connectGeminiRealtime({ ...realtimeOptions, conversationId: nextConversation.id })
         : await connectRealtime(realtimeOptions);
       connectionRef.current = connection;
       setStatus("Live");
@@ -265,7 +268,7 @@ function TalkScreen({
       connectionRef.current?.close();
       connectionRef.current = null;
       setStatus("Reconciling vocab");
-      const ended = await api.endConversation(conversation.id, transcript, notes);
+      const ended = await api.endConversation(conversation.id, transcriptRef.current, notes);
       setConversation(ended);
       setNotes("");
       await refresh();

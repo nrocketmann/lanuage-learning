@@ -4,7 +4,8 @@ import type { WebSocket as ServerWebSocket } from "ws";
 import WebSocket from "ws";
 import type { AppSettings, GeminiSmokeAttempt, GeminiSmokeResponse, QuizItem } from "../shared/types";
 import { serverConfig } from "./config";
-import { buildRealtimeInstructions, buildReviewTool } from "./openai";
+import { buildQuizItems, buildRealtimeInstructions, buildReviewTool } from "./openai";
+import { recordGeminiLiveUsageFromEvent } from "./usage";
 
 const DEVELOPER_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 const VERTEX_LIVE_MODEL = "gemini-live-2.5-flash-native-audio";
@@ -49,13 +50,22 @@ function readGcloudValue(args: string[]) {
   }
 }
 
+function withGcloudAccount(args: string[]) {
+  return serverConfig.vertexGcloudAccount ? ["--account", serverConfig.vertexGcloudAccount, ...args] : args;
+}
+
 function resolveConfiguredVertexProjectId() {
   return serverConfig.vertexProjectId;
 }
 
 function resolveExplicitGcloudProjectId() {
-  if (!serverConfig.vertexUseGcloudADC) return "";
+  if (!serverConfig.vertexUseGcloudAuth && !serverConfig.vertexUseGcloudADC) return "";
   return serverConfig.vertexProjectId || readGcloudValue(["config", "get-value", "project"]);
+}
+
+function resolveExplicitGcloudAuthToken() {
+  if (!serverConfig.vertexUseGcloudAuth) return "";
+  return readGcloudValue(withGcloudAccount(["auth", "print-access-token", "--quiet"]));
 }
 
 function resolveExplicitGcloudAdcToken() {
@@ -132,6 +142,22 @@ function buildGeminiReviewDeclaration() {
   };
 }
 
+function buildGeminiLoadQuizDeclaration() {
+  return {
+    name: "load_due_quiz_items",
+    description: "Load the due vocabulary quiz items after the learner explicitly agrees to take the quiz.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: []
+    }
+  };
+}
+
+function buildGeminiInstructions(settings: AppSettings, dueItems: QuizItem[]) {
+  return buildRealtimeInstructions(settings, dueItems, { quizAccess: "tool" });
+}
+
 function buildDeveloperSetup({
   settings,
   dueItems,
@@ -156,9 +182,9 @@ function buildDeveloperSetup({
         }
       },
       systemInstruction: {
-        parts: [{ text: buildRealtimeInstructions(settings, dueItems) }]
+        parts: [{ text: buildGeminiInstructions(settings, dueItems) }]
       },
-      tools: [{ functionDeclarations: [buildGeminiReviewDeclaration()] }],
+      tools: [{ functionDeclarations: [buildGeminiLoadQuizDeclaration(), buildGeminiReviewDeclaration()] }],
       inputAudioTranscription: {},
       outputAudioTranscription: {},
       realtimeInputConfig: {
@@ -199,9 +225,9 @@ function buildVertexSetup({
         }
       },
       system_instruction: {
-        parts: [{ text: buildRealtimeInstructions(settings, dueItems) }]
+        parts: [{ text: buildGeminiInstructions(settings, dueItems) }]
       },
-      tools: [{ function_declarations: [buildGeminiReviewDeclaration()] }],
+      tools: [{ function_declarations: [buildGeminiLoadQuizDeclaration(), buildGeminiReviewDeclaration()] }],
       input_audio_transcription: {},
       output_audio_transcription: {},
       realtime_input_config: {
@@ -295,7 +321,6 @@ function buildToolResponseMessage(format: GeminiWireFormat, functionResponses: u
           const typed = objectFrom(response);
           return {
             name: typed.name,
-            id: typed.id,
             response: typed.response
           };
         })
@@ -404,6 +429,34 @@ function extractError(data: Record<string, unknown>) {
   if (typeof error === "string") return error;
   const typed = objectFrom(error);
   return String(typed.message ?? JSON.stringify(error));
+}
+
+function extractFunctionCalls(data: Record<string, unknown>) {
+  const toolCall = objectFrom(data.toolCall ?? data.tool_call);
+  const rawCalls = toolCall.functionCalls ?? toolCall.function_calls;
+  if (!Array.isArray(rawCalls)) return [];
+
+  return rawCalls.flatMap((rawCall, index) => {
+    const call = objectFrom(rawCall);
+    const name = call.name;
+    if (typeof name !== "string") return [];
+    const id = typeof call.id === "string" ? call.id : `${name}-${index}-${JSON.stringify(call.args ?? {})}`;
+    return [{ id, name }];
+  });
+}
+
+function hasLearnerSpeech(data: Record<string, unknown>) {
+  const serverContent = objectFrom(data.serverContent ?? data.server_content);
+  const inputTranscription = objectFrom(serverContent.inputTranscription ?? serverContent.input_transcription);
+  return typeof inputTranscription.text === "string" && inputTranscription.text.trim().length > 0;
+}
+
+function hasAssistantActivity(data: Record<string, unknown>) {
+  return extractAudioBytes(data) > 0 || extractText(data).trim().length > 0 || extractFunctionCalls(data).length > 0;
+}
+
+function hasAssistantOutput(data: Record<string, unknown>) {
+  return extractAudioBytes(data) > 0 || extractText(data).trim().length > 0;
 }
 
 function runWebSocketSmoke(config: LiveConfig): Promise<GeminiSmokeAttempt> {
@@ -571,6 +624,20 @@ async function resolveLiveConfig(settings: AppSettings, dueItems: QuizItem[]): P
     });
   }
 
+  if (serverConfig.vertexUseGcloudAuth) {
+    const projectId = resolveExplicitGcloudProjectId();
+    const token = resolveExplicitGcloudAuthToken();
+    if (projectId && token) {
+      return buildVertexConfig({
+        bearerToken: token,
+        credentialSource: "gcloud-auth",
+        projectId,
+        settings,
+        dueItems
+      });
+    }
+  }
+
   if (serverConfig.vertexUseGcloudADC) {
     const projectId = resolveExplicitGcloudProjectId();
     const token = resolveExplicitGcloudAdcToken();
@@ -586,7 +653,9 @@ async function resolveLiveConfig(settings: AppSettings, dueItems: QuizItem[]): P
   }
 
   const projectHint = configuredProjectId ? "" : " Set VERTEX_PROJECT_ID for Vertex Live.";
-  const gcloudHint = serverConfig.vertexUseGcloudADC ? " Explicit gcloud ADC was enabled but did not provide a project/token." : " Local gcloud ADC is disabled unless VERTEX_USE_GCLOUD_ADC=true.";
+  const gcloudHint = serverConfig.vertexUseGcloudAuth || serverConfig.vertexUseGcloudADC
+    ? " Explicit gcloud auth was enabled but did not provide a project/token."
+    : " Local gcloud auth is disabled unless VERTEX_USE_GCLOUD_AUTH=true or VERTEX_USE_GCLOUD_ADC=true.";
   const expressHint = serverConfig.vertexKey ? " VERTEX_KEY appears to be a Vertex/Agent Platform API key; it can be useful for REST Express calls, but this Live WebSocket needs a Gemini API key or Vertex OAuth credential." : "";
   throw new Error(`No usable Gemini Live WebSocket credential is configured. Set GEMINI_API_KEY/GOOGLE_API_KEY for the Gemini Developer Live API, or set VERTEX_PROJECT_ID plus VERTEX_ACCESS_TOKEN for Vertex Live.${projectHint}${gcloudHint}${expressHint}`);
 }
@@ -609,18 +678,26 @@ export async function handleGeminiLiveSocket({
   socket,
   settings,
   dueItems,
+  conversationId,
   log
 }: {
   socket: ServerWebSocket;
   settings: AppSettings;
   dueItems: QuizItem[];
+  conversationId?: number | null;
   log: FastifyBaseLogger;
 }) {
   let upstream: WebSocket | null = null;
   let upstreamConfig: LiveConfig | null = null;
   let readyForInput = false;
   let startupPromptSent = false;
+  let acceptingLearnerAudio = false;
+  let learnerHasSpokenSincePrompt = false;
+  let assistantOutputThisTurn = false;
+  let connectedStatusSent = false;
+  let usageSequence = 0;
   const queuedInputs: unknown[] = [];
+  const handledServerToolCalls = new Set<string>();
 
   const queueOrSend = (payload: unknown) => {
     if (readyForInput && safeUpstreamSend(upstream, payload)) return;
@@ -644,6 +721,74 @@ export async function handleGeminiLiveSocket({
     upstream.close();
   };
 
+  const closeLearnerAudioWindow = () => {
+    acceptingLearnerAudio = false;
+  };
+
+  const openLearnerAudioWindow = () => {
+    acceptingLearnerAudio = true;
+    learnerHasSpokenSincePrompt = false;
+    safeSend(socket, { type: "status", status: connectedStatusSent ? "Listening" : "Connected" });
+    connectedStatusSent = true;
+  };
+
+  const sendLoadQuizToolResponse = (callId: string, allowed: boolean) => {
+    if (!upstreamConfig) return;
+    closeLearnerAudioWindow();
+    learnerHasSpokenSincePrompt = false;
+    const response = allowed
+      ? {
+          ok: true,
+          count: dueItems.length,
+          quiz_items: buildQuizItems(dueItems),
+          instruction: "Ask only the first not-yet-reviewed item now, then stop and wait for the learner's answer."
+        }
+      : {
+          ok: false,
+          error: "You must ask whether the learner wants the latest quiz and wait for an affirmative answer before loading quiz items.",
+          instruction: "Ask whether the learner wants to do the latest quiz, then stop and wait. Do not ask a quiz item yet."
+        };
+
+    safeUpstreamSend(upstream, buildToolResponseMessage(upstreamConfig.wireFormat, [{
+      name: "load_due_quiz_items",
+      id: callId,
+      response
+    }]));
+  };
+
+  const sendInvalidReviewToolResponse = (callId: string) => {
+    if (!upstreamConfig) return;
+    closeLearnerAudioWindow();
+    learnerHasSpokenSincePrompt = false;
+    safeUpstreamSend(upstream, buildToolResponseMessage(upstreamConfig.wireFormat, [{
+      name: "record_quiz_review",
+      id: callId,
+      response: {
+        ok: false,
+        error: "No learner answer has been received for the current quiz prompt. Do not record a review.",
+        instruction: "Ask the same current item again briefly, then stop and wait."
+      }
+    }]));
+  };
+
+  const maybeHandleServerToolCalls = (event: Record<string, unknown>) => {
+    let shouldForwardToBrowser = true;
+    for (const call of extractFunctionCalls(event)) {
+      const key = `${call.name}:${call.id}`;
+      if (handledServerToolCalls.has(key)) continue;
+      if (call.name === "load_due_quiz_items") {
+        handledServerToolCalls.add(key);
+        sendLoadQuizToolResponse(call.id, learnerHasSpokenSincePrompt);
+      }
+      if (call.name === "record_quiz_review" && !learnerHasSpokenSincePrompt) {
+        handledServerToolCalls.add(key);
+        sendInvalidReviewToolResponse(call.id);
+        shouldForwardToBrowser = false;
+      }
+    }
+    return shouldForwardToBrowser;
+  };
+
   socket.on("message", (raw) => {
     let input: LiveSocketInput;
     try {
@@ -655,14 +800,18 @@ export async function handleGeminiLiveSocket({
 
     const format = upstreamConfig?.wireFormat ?? "developer";
     if (input.type === "audio" && typeof input.data === "string") {
+      if (!acceptingLearnerAudio) return;
       queueOrSend(buildAudioMessage(format, input.data));
       return;
     }
     if (input.type === "tool_response") {
-      queueOrSend(buildToolResponseMessage(format, input.functionResponses));
+      closeLearnerAudioWindow();
+      learnerHasSpokenSincePrompt = false;
+      safeUpstreamSend(upstream, buildToolResponseMessage(format, input.functionResponses));
       return;
     }
     if (input.type === "client_text" && typeof input.text === "string") {
+      learnerHasSpokenSincePrompt = true;
       queueOrSend(buildTextMessage(format, input.text));
       return;
     }
@@ -702,19 +851,53 @@ export async function handleGeminiLiveSocket({
         return;
       }
 
-      safeSend(socket, { type: "event", event });
-
       const error = extractError(event);
       if (error) {
         safeSend(socket, { type: "error", error });
       }
 
+      if (event.usageMetadata || event.usage_metadata) {
+        usageSequence += 1;
+        recordGeminiLiveUsageFromEvent({
+          conversationId,
+          model: upstreamConfig?.model ?? settings.realtimeModel,
+          payload: event,
+          sequence: usageSequence
+        });
+      }
+
+      if (acceptingLearnerAudio && hasLearnerSpeech(event)) {
+        learnerHasSpokenSincePrompt = true;
+      }
+
+      const shouldForwardToBrowser = maybeHandleServerToolCalls(event);
+
+      if (hasAssistantOutput(event)) {
+        assistantOutputThisTurn = true;
+      }
+
+      if (hasAssistantActivity(event)) {
+        closeLearnerAudioWindow();
+      }
+
+      if (shouldForwardToBrowser) {
+        safeSend(socket, { type: "event", event });
+      }
+
       if (isSetupComplete(event) && upstreamConfig && !startupPromptSent) {
         startupPromptSent = true;
         readyForInput = true;
+        closeLearnerAudioWindow();
         safeUpstreamSend(upstream, upstreamConfig.startMessage);
         flushQueuedInputs();
-        safeSend(socket, { type: "status", status: "Connected" });
+        safeSend(socket, { type: "status", status: "Opening prompt" });
+      }
+
+      if (isTurnComplete(event) && startupPromptSent) {
+        if (assistantOutputThisTurn) {
+          openLearnerAudioWindow();
+        }
+        assistantOutputThisTurn = false;
       }
     });
 
@@ -772,6 +955,28 @@ export async function smokeGeminiLive(settings: AppSettings): Promise<GeminiSmok
       settings,
       dueItems: emptyDueItems
     })));
+  }
+
+  if (!attempts.some((attempt) => attempt.ok) && serverConfig.vertexUseGcloudAuth) {
+    const projectId = resolveExplicitGcloudProjectId();
+    const token = resolveExplicitGcloudAuthToken();
+    if (projectId && token) {
+      attempts.push(await runWebSocketSmoke(buildVertexConfig({
+        bearerToken: token,
+        credentialSource: "gcloud-auth",
+        projectId,
+        settings,
+        dueItems: emptyDueItems
+      })));
+    } else {
+      attempts.push({
+        endpoint: "vertex-live",
+        credentialSource: "gcloud-auth",
+        model: vertexModel(settings),
+        ok: false,
+        error: "VERTEX_USE_GCLOUD_AUTH=true, but gcloud did not return both a project and an active-account access token."
+      });
+    }
   }
 
   if (!attempts.some((attempt) => attempt.ok) && serverConfig.vertexUseGcloudADC) {

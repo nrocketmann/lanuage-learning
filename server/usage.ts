@@ -41,6 +41,22 @@ const pricingPerMillionTokens: Record<string, ModelPricing> = {
     inputAudio: 32,
     cachedInputAudio: 0.4,
     outputAudio: 64
+  },
+  "gemini-live-2.5-flash-native-audio": {
+    inputText: 0.5,
+    cachedInputText: 0,
+    outputText: 2,
+    inputAudio: 3,
+    cachedInputAudio: 0,
+    outputAudio: 12
+  },
+  "gemini-2.5-flash-native-audio-preview-12-2025": {
+    inputText: 0.5,
+    cachedInputText: 0,
+    outputText: 2,
+    inputAudio: 3,
+    cachedInputAudio: 0,
+    outputAudio: 12
   }
 };
 
@@ -67,6 +83,20 @@ function nestedNumber(source: Record<string, unknown>, path: string[]) {
     current = objectFrom(current)[key];
   }
   return numberFrom(current);
+}
+
+function camelOrSnakeNumber(source: Record<string, unknown>, camelKey: string, snakeKey: string) {
+  return numberFrom(source[camelKey]) || numberFrom(source[snakeKey]);
+}
+
+function detailsTokenCount(source: unknown, modality: string) {
+  const details = Array.isArray(source) ? source : [];
+  return details.reduce((sum, detail) => {
+    const typed = objectFrom(detail);
+    const detailModality = String(typed.modality ?? "").toLowerCase();
+    if (detailModality !== modality) return sum;
+    return sum + camelOrSnakeNumber(typed, "tokenCount", "token_count");
+  }, 0);
 }
 
 function estimateCostUsd(model: string, usage: UsageBreakdown) {
@@ -169,5 +199,49 @@ export function recordRealtimeUsageFromEvent({
     estimatedCostUsd: estimateCostUsd(model, breakdown),
     rawUsage: usage,
     idempotencyKey: responseId ? `realtime:${responseId}` : null
+  });
+}
+
+export function recordGeminiLiveUsageFromEvent({
+  conversationId,
+  model,
+  payload,
+  sequence
+}: {
+  conversationId?: number | null;
+  model: string;
+  payload: unknown;
+  sequence: number;
+}) {
+  const event = objectFrom(payload);
+  const usage = objectFrom(event.usageMetadata ?? event.usage_metadata);
+  if (!Object.keys(usage).length) return;
+
+  const promptDetails = usage.promptTokensDetails ?? usage.prompt_tokens_details;
+  const candidateDetails = usage.candidatesTokensDetails ?? usage.candidates_tokens_details;
+  const promptTokenCount = camelOrSnakeNumber(usage, "promptTokenCount", "prompt_token_count");
+  const candidateTokenCount = camelOrSnakeNumber(usage, "candidatesTokenCount", "candidates_token_count");
+  const inputAudioTokens = detailsTokenCount(promptDetails, "audio");
+  const outputAudioTokens = detailsTokenCount(candidateDetails, "audio");
+  const inputTextTokens = detailsTokenCount(promptDetails, "text") || Math.max(0, promptTokenCount - inputAudioTokens);
+  const outputTextTokens = detailsTokenCount(candidateDetails, "text") || Math.max(0, candidateTokenCount - outputAudioTokens);
+
+  const breakdown = {
+    inputTextTokens,
+    cachedInputTextTokens: 0,
+    outputTextTokens,
+    inputAudioTokens,
+    cachedInputAudioTokens: 0,
+    outputAudioTokens
+  };
+
+  recordUsageEvent({
+    conversationId,
+    operation: "gemini_live_turn",
+    model,
+    ...breakdown,
+    estimatedCostUsd: estimateCostUsd(model, breakdown),
+    rawUsage: usage,
+    idempotencyKey: conversationId ? `gemini-live:${conversationId}:${sequence}` : null
   });
 }

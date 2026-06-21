@@ -31,7 +31,7 @@ function buildQuizPrompt(item: QuizItem) {
   return `How would you say "${word.meaningDisambiguator || word.meaning}" in ${word.surfaceForm ? "Japanese" : "the target language"}?`;
 }
 
-function buildQuizItems(dueItems: QuizItem[]) {
+export function buildQuizItems(dueItems: QuizItem[]) {
   return dueItems.slice(0, 8).map((item, index) => {
     const word = item.wordSense;
     return {
@@ -95,9 +95,14 @@ export function buildReviewTool() {
   };
 }
 
-export function buildRealtimeInstructions(settings: AppSettings, dueItems: QuizItem[]) {
+export function buildRealtimeInstructions(
+  settings: AppSettings,
+  dueItems: QuizItem[],
+  options: { quizAccess?: "inline" | "tool" } = {}
+) {
   const quizItems = buildQuizItems(dueItems);
-  const quizBlock = quizItems.length
+  const quizAccess = options.quizAccess ?? "inline";
+  const quizBlock = quizAccess === "inline" && quizItems.length
     ? JSON.stringify(quizItems, null, 2)
     : "[]";
 
@@ -115,18 +120,27 @@ export function buildRealtimeInstructions(settings: AppSettings, dueItems: QuizI
         ? `Your first spoken turn must be short: greet the learner once, say there are ${quizItems.length} vocabulary quiz item(s) due, and ask whether they want to do the latest quiz before conversation. Then stop and wait for the learner.`
         : "Your first spoken turn must be short: greet the learner once, say there are no vocabulary reviews due, and ask what they want to talk about. Then stop and wait for the learner.",
       "Do not start any second greeting or alternate opening dialogue.",
-      "Do not begin the quiz until the learner says yes or otherwise agrees."
+      "Do not begin the quiz until the learner says yes or otherwise agrees.",
+      quizAccess === "tool"
+        ? "You cannot see the quiz items yet. Do not invent, summarize, preview, or ask any quiz item in your startup turn."
+        : "The quiz items are provided below for use only after the learner agrees."
     ].join("\n"),
     [
       "VERBAL QUIZ FLOW",
-      "If the learner agrees to quiz, administer the items below one at a time in order.",
+      quizAccess === "tool"
+        ? "If, and only if, the learner agrees to quiz, call load_due_quiz_items exactly once. Wait for the tool response before asking any quiz question."
+        : "If the learner agrees to quiz, administer the items below one at a time in order.",
+      "Administer quiz items one at a time in order. Never ask the next item until the learner has answered the current item and record_quiz_review has completed for it.",
       "Ask the prompt verbally, wait for the learner's answer, judge it generously but honestly for the listed sense, and then call record_quiz_review exactly once for that item.",
+      "Never call record_quiz_review from silence, background audio, your own speech, or an inferred answer. Only record Skip if the learner explicitly asks to skip.",
       "If the learner asks for a hint or needs the sentence/extra help before answering, set usedHint=true and correct=false even if they answer after the hint.",
       "For production items, accept kana/kanji variants and close equivalents only when they express the same saved sense.",
       "After the tool result comes back, briefly say whether they got it and continue to the next item.",
       "After the final quiz item, transition naturally into conversation."
     ].join("\n"),
-    `VERBAL QUIZ ITEMS\n${quizBlock}`
+    quizAccess === "tool"
+      ? `QUIZ ACCESS\nThe quiz currently has ${quizItems.length} due item(s). The actual items are hidden until load_due_quiz_items returns them.`
+      : `VERBAL QUIZ ITEMS\n${quizBlock}`
   ].join("\n\n");
 }
 

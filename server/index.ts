@@ -80,6 +80,7 @@ app.get("/api/health", async () => ({
   hasVertexKey: Boolean(serverConfig.vertexKey),
   hasVertexAccessToken: Boolean(serverConfig.vertexAccessToken),
   hasVertexProjectId: Boolean(serverConfig.vertexProjectId),
+  vertexUseGcloudAuth: serverConfig.vertexUseGcloudAuth,
   vertexUseGcloudADC: serverConfig.vertexUseGcloudADC,
   counts: getCounts()
 }));
@@ -92,13 +93,17 @@ app.get("/api/usage", async () => getUsageSummary());
 
 app.post("/api/gemini/smoke", async () => smokeGeminiLive(getSettings()));
 
-app.get("/api/gemini/live", { websocket: true }, (socket) => {
+app.get("/api/gemini/live", { websocket: true }, (socket, request) => {
   const settings = getSettings();
   const dueItems = getDueQuizItems(settings.maxQuizItems);
+  const query = z.object({
+    conversationId: z.coerce.number().int().optional()
+  }).parse(request.query);
   void handleGeminiLiveSocket({
     socket,
     settings,
     dueItems,
+    conversationId: query.conversationId ?? null,
     log: app.log
   });
 });

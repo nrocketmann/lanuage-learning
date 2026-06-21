@@ -96,6 +96,7 @@ export type HealthResponse = {
   hasVertexKey: boolean;
   hasVertexAccessToken: boolean;
   hasVertexProjectId: boolean;
+  vertexUseGcloudAuth: boolean;
   vertexUseGcloudADC: boolean;
   counts: {
     wordSenses: number;
@@ -106,7 +107,7 @@ export type HealthResponse = {
 
 export type GeminiSmokeAttempt = {
   endpoint: "vertex-live" | "developer-api" | "vertex-express-rest";
-  credentialSource: "vertex-key" | "vertex-access-token" | "gcloud-adc" | "gemini-api-key" | "vertex-express-key" | "missing";
+  credentialSource: "vertex-key" | "vertex-access-token" | "gcloud-auth" | "gcloud-adc" | "gemini-api-key" | "vertex-express-key" | "missing";
   model: string;
   ok: boolean;
   text?: string;

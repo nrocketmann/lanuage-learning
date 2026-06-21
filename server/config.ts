@@ -13,6 +13,8 @@ export const serverConfig = {
   vertexAccessToken: process.env.VERTEX_ACCESS_TOKEN ?? "",
   vertexProjectId: process.env.VERTEX_PROJECT_ID ?? process.env.GOOGLE_CLOUD_PROJECT ?? process.env.GCLOUD_PROJECT ?? "",
   vertexLocation: process.env.VERTEX_LOCATION ?? "us-central1",
+  vertexUseGcloudAuth: process.env.VERTEX_USE_GCLOUD_AUTH === "true",
+  vertexGcloudAccount: process.env.VERTEX_GCLOUD_ACCOUNT ?? "",
   vertexUseGcloudADC: process.env.VERTEX_USE_GCLOUD_ADC === "true",
   databasePath: process.env.DATABASE_PATH ?? path.resolve(process.cwd(), "data", "app.db")
 };
